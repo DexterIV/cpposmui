@@ -1,0 +1,8 @@
+build/
+.cache/
+*.user
+.vs/
+cmake-build-*/
+.vscode/
+.claude/settings.local.json
+out/

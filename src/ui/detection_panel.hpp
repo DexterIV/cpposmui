@@ -43,25 +43,43 @@ public:
         imagery_zoom_ = zoom;
     }
 
-    // Callback that assembles a stitched RGB mosaic from the tile cache for the
-    // current view bbox.  Returns (pixels, width, height); empty on failure.
-    // Must be called from the GL thread.
-    struct Mosaic { std::vector<uint8_t> rgb; int w{0}, h{0}; };
+    // Callback that assembles a stitched RGB mosaic from the GL tile cache for
+    // the current view bbox.  Returns (pixels, width, height); empty on failure.
+    // Used by the "CV on imagery" source to read the displayed base imagery
+    // without re-downloading.  Must be called from the GL thread.
+    // The pixels cover whole tiles, so the mosaic's geographic extent is
+    // tile-aligned and LARGER than the requested bbox. The detector must map
+    // pixels back using THIS extent (min/max lat/lon), otherwise features drift
+    // relative to the imagery. 0,0,0,0 extent means "failed / empty".
+    struct Mosaic {
+        std::vector<uint8_t> rgb; int w{0}, h{0};
+        double min_lat{0}, min_lon{0}, max_lat{0}, max_lon{0};
+    };
     using MosaicFn = std::function<Mosaic(double min_lat, double min_lon,
                                           double max_lat, double max_lon, int zoom)>;
     void set_mosaic_callback(MosaicFn fn) { mosaic_fn_ = std::move(fn); }
 
-    // Callback that assembles a grayscale mosaic from a specific overlay tile
-    // cache (e.g. the NMPT LiDAR layer).  Same bbox/zoom contract as MosaicFn.
-    using DsmMosaicFn = std::function<Mosaic(double min_lat, double min_lon,
-                                             double max_lat, double max_lon, int zoom)>;
-    void set_dsm_mosaic_callback(DsmMosaicFn fn) { dsm_mosaic_fn_ = std::move(fn); }
+    // WMS GetMap template for the LiDAR DSM (Geoportal NMPT).  The "CV + LiDAR"
+    // source fetches this layer by bbox itself, so the DSM is always sourced
+    // correctly regardless of which overlay the user has displayed.
+    void set_dsm_url(std::string url) { dsm_url_ = std::move(url); }
 
     // Map click interaction: select/approve/reject features by clicking on the map.
     void select_feature(int idx);
     int  selected_feature() const { return selected_idx_; }
     void approve_selected();
     void reject_selected();
+    // Permanently delete the map-selected feature from the candidate list
+    // (distinct from reject, which keeps a greyed entry).
+    void remove_selected();
+
+    // Hit-test a screen-space click against candidate features. Returns the index
+    // of the closest feature within `tol_px`, or -1. geo_to_screen maps a feature
+    // vertex (lat,lon) to a screen pixel. Pending/Accepted features are testable;
+    // Rejected ones are skipped.
+    int hit_test(ImVec2 mouse,
+                 const std::function<ImVec2(double lat, double lon)>& geo_to_screen,
+                 float tol_px = 8.0f) const;
 
     // Render the dockable panel window.
     void draw(bool* p_open);
@@ -86,9 +104,10 @@ private:
     std::string model_path_;        // ONNX model file
     std::string imagery_url_;       // active base tile template (key substituted)
     int         imagery_zoom_{17};  // zoom the ONNX mosaic is assembled at
+    float       simplify_px_{3.5f}; // Douglas-Peucker tolerance for CV outlines
 
     MosaicFn    mosaic_fn_;         // assembles RGB mosaic from base tile cache
-    DsmMosaicFn dsm_mosaic_fn_;     // assembles grayscale mosaic from DSM overlay
+    std::string dsm_url_;           // WMS template for the LiDAR DSM (NMPT)
 
     // Detection state
     bool running_{false};
@@ -116,6 +135,9 @@ private:
 
     void run_detection();
     void accept_checked();
+    // Erase the checked candidates from result_->features (and keep checked_ /
+    // selected_idx_ consistent).  Caller must hold result_mu_.
+    void remove_checked_locked();
 };
 
 } // namespace ui

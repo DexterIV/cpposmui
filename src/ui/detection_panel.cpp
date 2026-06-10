@@ -1,5 +1,6 @@
 #include "detection_panel.hpp"
 #include "../ai/detection.hpp"
+#include "../log.hpp"
 #include <imgui.h>
 #include <misc/cpp/imgui_stdlib.h>
 #include <cmath>
@@ -112,6 +113,8 @@ void DetectionPanel::run_detection() {
     if (running_) return;
     running_ = true;
     status_  = "Running detection…";
+    LOG_INFO("detection: run source={} bbox {:.5f},{:.5f}..{:.5f},{:.5f} zoom={} simplify={:.1f}",
+             source_, min_lat_, min_lon_, max_lat_, max_lon_, imagery_zoom_, simplify_px_);
 
     auto on_done = [this](ai::DetectionResult res) {
         auto sp = std::make_shared<ai::DetectionResult>(std::move(res));
@@ -123,6 +126,11 @@ void DetectionPanel::run_detection() {
             ? std::format("{} feature(s) found  ({})",
                            result_->features.size(), result_->source_name)
             : std::format("Error: {}", result_->error);
+        if (result_->ok())
+            LOG_INFO("detection: done — {} feature(s) ({})",
+                     result_->features.size(), result_->source_name);
+        else
+            LOG_WARN("detection: failed — {}", result_->error);
     };
 
     switch (source_) {
@@ -161,32 +169,25 @@ void DetectionPanel::run_detection() {
             if (m.rgb.empty()) {
                 running_ = false; status_ = "No cached tiles in view — pan around first"; break;
             }
+            // Map pixels back using the mosaic's tile-aligned extent (NOT the
+            // requested bbox) — otherwise detected features drift vs the imagery.
             ai::detect_cv_on_imagery(m.rgb, m.w, m.h,
-                                     min_lat_, min_lon_, max_lat_, max_lon_,
-                                     std::move(on_done));
+                                     m.min_lat, m.min_lon, m.max_lat, m.max_lon,
+                                     std::move(on_done), simplify_px_);
         } else if (source_ == SRC_CV_LIDAR) {
-            if (!mosaic_fn_ || !dsm_mosaic_fn_) {
+            if (imagery_url_.empty()) {
+                running_ = false; status_ = "No imagery base layer selected"; break;
+            }
+            if (dsm_url_.empty()) {
                 running_ = false;
-                status_ = "Enable the Geoportal LiDAR NMPT overlay first"; break;
+                status_ = "LiDAR NMPT layer unavailable in catalog"; break;
             }
-            auto m = mosaic_fn_(min_lat_, min_lon_, max_lat_, max_lon_, imagery_zoom_);
-            auto d = dsm_mosaic_fn_(min_lat_, min_lon_, max_lat_, max_lon_, imagery_zoom_);
-            if (m.rgb.empty()) {
-                running_ = false; status_ = "No cached imagery tiles in view"; break;
-            }
-            if (d.rgb.empty()) {
-                running_ = false;
-                status_ = "No cached LiDAR DSM tiles — enable and pan first"; break;
-            }
-            // Convert DSM mosaic to single-channel grayscale.
-            std::vector<uint8_t> dsm_gray((size_t)d.w * d.h);
-            for (size_t i = 0; i < dsm_gray.size(); ++i)
-                dsm_gray[i] = (uint8_t)(0.299 * d.rgb[i*3]
-                                      + 0.587 * d.rgb[i*3+1]
-                                      + 0.114 * d.rgb[i*3+2]);
-            ai::detect_cv_with_dsm(m.rgb, dsm_gray, m.w, m.h,
-                                   min_lat_, min_lon_, max_lat_, max_lon_,
-                                   std::move(on_done));
+            // Fetches both the imagery and the NMPT DSM by bbox on a worker
+            // thread — the DSM is always the LiDAR layer, independent of which
+            // overlay is currently displayed on the map.
+            ai::detect_cv_lidar_bbox(imagery_url_, dsm_url_, imagery_zoom_,
+                                     min_lat_, min_lon_, max_lat_, max_lon_,
+                                     std::move(on_done), simplify_px_);
         } else {
             running_ = false; status_ = "Unknown source";
         }
@@ -208,7 +209,45 @@ void DetectionPanel::accept_checked() {
             accepted.push_back(result_->features[i]);
         }
     }
-    if (!accepted.empty()) on_accept_(std::move(accepted));
+    if (!accepted.empty()) {
+        LOG_INFO("detection: accepting {} feature(s) onto layer", accepted.size());
+        on_accept_(std::move(accepted));
+    }
+}
+
+// ── remove_checked_locked ─────────────────────────────────────────────────────
+// Permanently drop every checked candidate. Unlike "Reject checked" (which keeps
+// a greyed, non-removable entry) this erases the features outright and rebuilds
+// the parallel checked_ vector. Caller holds result_mu_.
+void DetectionPanel::remove_checked_locked() {
+    if (!result_) return;
+    std::vector<ai::DetectedFeature> kept;
+    kept.reserve(result_->features.size());
+    size_t removed = 0;
+    for (size_t i = 0; i < result_->features.size(); ++i) {
+        bool chk = (i < checked_.size()) && checked_[i];
+        if (chk) { ++removed; continue; }
+        kept.push_back(std::move(result_->features[i]));
+    }
+    if (removed == 0) return;
+    result_->features = std::move(kept);
+    checked_.assign(result_->features.size(), false); // indices shifted; clear
+    selected_idx_ = -1;
+    LOG_INFO("detection: removed {} candidate(s) from list — {} remaining",
+             removed, result_->features.size());
+}
+
+// ── remove_selected ───────────────────────────────────────────────────────────
+void DetectionPanel::remove_selected() {
+    std::scoped_lock lk(result_mu_);
+    if (!result_ || selected_idx_ < 0 ||
+        selected_idx_ >= (int)result_->features.size()) return;
+    LOG_INFO("detection: remove feature #{} ({}) from map",
+             selected_idx_, ai::feature_type_name(result_->features[selected_idx_].type));
+    result_->features.erase(result_->features.begin() + selected_idx_);
+    if ((size_t)selected_idx_ < checked_.size())
+        checked_.erase(checked_.begin() + selected_idx_);
+    selected_idx_ = -1;
 }
 
 // ── draw ──────────────────────────────────────────────────────────────────────
@@ -260,7 +299,17 @@ void DetectionPanel::draw(bool* p_open) {
     } else if (source_ == SRC_CV_LIDAR) {
         ImGui::TextDisabled("Edge detection + LiDAR DSM (Geoportal NMPT).");
         ImGui::TextDisabled("Elevated surfaces in DSM boost building confidence.");
-        ImGui::TextDisabled("Requires Geoportal LiDAR NMPT overlay active.");
+        ImGui::TextDisabled("DSM is fetched automatically — uses the active base");
+        ImGui::TextDisabled("imagery for RGB (Geoportal Ortofoto recommended).");
+    }
+
+    // Simplification tolerance — applies to the CV (Sobel / LiDAR) sources.
+    if (source_ == SRC_CV || source_ == SRC_CV_LIDAR) {
+        ImGui::SetNextItemWidth(-1);
+        ImGui::SliderFloat("Simplify (px)", &simplify_px_, 1.0f, 12.0f, "%.1f");
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Douglas-Peucker tolerance: higher = fewer nodes per\n"
+                              "feature (smoother outlines). Roads use 1.4x this.");
     }
 
     // ── Bbox display ──────────────────────────────────────────────────────────
@@ -309,8 +358,18 @@ void DetectionPanel::draw(bool* p_open) {
                         result_->features[i].status =
                             ai::DetectedFeature::Status::Rejected;
             }
+            ImGui::SameLine();
+            // Permanently delete the checked candidates from the list.
+            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.f, .5f, .5f, 1.f));
+            bool do_remove = ImGui::SmallButton("Remove checked");
+            ImGui::PopStyleColor();
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("Delete the checked candidates from the list\n"
+                                  "(permanent — unlike Reject, no entry is kept).");
+            if (do_remove) remove_checked_locked();
 
             // Feature list
+            int remove_one = -1; // single-row delete, applied after the loop
             ImGui::BeginChild("feat_list", ImVec2(0, -40),
                               ImGuiChildFlags_Borders);
             for (size_t i = 0; i < result_->features.size(); ++i) {
@@ -329,6 +388,14 @@ void DetectionPanel::draw(bool* p_open) {
                 if (ImGui::Checkbox("##c", &chk)) {
                     if (i < checked_.size()) checked_[i] = chk;
                 }
+                ImGui::SameLine();
+
+                // Per-row permanent delete.
+                ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.f, .5f, .5f, 1.f));
+                if (ImGui::SmallButton("✕")) remove_one = (int)i;
+                ImGui::PopStyleColor();
+                if (ImGui::IsItemHovered())
+                    ImGui::SetTooltip("Remove this candidate from the list");
                 ImGui::SameLine();
 
                 // Label
@@ -369,6 +436,19 @@ void DetectionPanel::draw(bool* p_open) {
             }
             ImGui::EndChild();
 
+            // Apply a deferred single-row delete (done outside the loop so the
+            // vector isn't mutated mid-iteration).
+            if (remove_one >= 0 && remove_one < (int)result_->features.size()) {
+                LOG_INFO("detection: remove feature #{} ({}) from list",
+                         remove_one,
+                         ai::feature_type_name(result_->features[remove_one].type));
+                result_->features.erase(result_->features.begin() + remove_one);
+                if (remove_one < (int)checked_.size())
+                    checked_.erase(checked_.begin() + remove_one);
+                if (selected_idx_ == remove_one) selected_idx_ = -1;
+                else if (selected_idx_ > remove_one) --selected_idx_;
+            }
+
             // Accept button
             int n_checked = (int)std::count(checked_.begin(), checked_.end(), true);
             ImGui::BeginDisabled(n_checked == 0 || !on_accept_);
@@ -383,6 +463,55 @@ void DetectionPanel::draw(bool* p_open) {
 }
 
 // ── Map click interaction ────────────────────────────────────────────────────
+int DetectionPanel::hit_test(
+    ImVec2 mouse,
+    const std::function<ImVec2(double, double)>& geo_to_screen,
+    float tol_px) const
+{
+    std::scoped_lock lk(result_mu_);
+    if (!result_) return -1;
+
+    auto seg_dist = [](ImVec2 p, ImVec2 a, ImVec2 b) -> float {
+        float vx = b.x - a.x, vy = b.y - a.y;
+        float wx = p.x - a.x, wy = p.y - a.y;
+        float c1 = vx * wx + vy * wy;
+        if (c1 <= 0) return std::hypot(p.x - a.x, p.y - a.y);
+        float c2 = vx * vx + vy * vy;
+        if (c2 <= c1) return std::hypot(p.x - b.x, p.y - b.y);
+        float t = c1 / c2;
+        return std::hypot(p.x - (a.x + t * vx), p.y - (a.y + t * vy));
+    };
+
+    int best = -1;
+    float best_d = tol_px;
+    for (size_t fi = 0; fi < result_->features.size(); ++fi) {
+        const auto& f = result_->features[fi];
+        if (f.status == ai::DetectedFeature::Status::Rejected) continue;
+        if (f.coords.empty()) continue;
+
+        if (f.coords.size() == 1) {
+            ImVec2 p = geo_to_screen(f.coords[0].first, f.coords[0].second);
+            float d = std::hypot(mouse.x - p.x, mouse.y - p.y);
+            if (d < best_d) { best_d = d; best = (int)fi; }
+            continue;
+        }
+        ImVec2 prev = geo_to_screen(f.coords[0].first, f.coords[0].second);
+        for (size_t i = 1; i < f.coords.size(); ++i) {
+            ImVec2 cur = geo_to_screen(f.coords[i].first, f.coords[i].second);
+            float d = seg_dist(mouse, prev, cur);
+            if (d < best_d) { best_d = d; best = (int)fi; }
+            prev = cur;
+        }
+        if (f.is_area && f.coords.size() >= 3) { // closing edge of the ring
+            ImVec2 a = geo_to_screen(f.coords.back().first,  f.coords.back().second);
+            ImVec2 b = geo_to_screen(f.coords.front().first, f.coords.front().second);
+            float d = seg_dist(mouse, a, b);
+            if (d < best_d) { best_d = d; best = (int)fi; }
+        }
+    }
+    return best;
+}
+
 void DetectionPanel::select_feature(int idx) {
     std::scoped_lock lk(result_mu_);
     if (!result_ || idx < 0 || idx >= (int)result_->features.size())
@@ -401,6 +530,8 @@ void DetectionPanel::approve_selected() {
         if ((size_t)selected_idx_ < checked_.size())
             checked_[selected_idx_] = true;
         if (on_accept_) {
+            LOG_INFO("detection: add feature #{} ({}) from map",
+                     selected_idx_, ai::feature_type_name(f.type));
             std::vector<ai::DetectedFeature> v{f};
             on_accept_(std::move(v));
         }

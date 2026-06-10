@@ -53,6 +53,11 @@ public:
     // Switch tile source
     void set_tile_source(map::TileSource src);
 
+    // Purge the entire on-disk tile cache (all sources) and drop the in-memory
+    // tiles for the active base + overlay so the current view re-fetches.
+    // Returns bytes freed from disk. Must be called from the GL thread.
+    std::uintmax_t purge_tile_cache();
+
     // ── View state accessors (for persistence) ──
     double center_lat() const { return center_lat_; }
     double center_lon() const { return center_lon_; }

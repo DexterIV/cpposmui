@@ -18,11 +18,13 @@
 #include "net/osm_upload.hpp"
 #include "net/oauth.hpp"
 #include "osm/data_layer.hpp"
+#include "log.hpp"
 
 #include <nlohmann/json.hpp>
 
 #include <cstdio>
 #include <cstdlib>
+#include <cstdint>
 #include <cctype>
 #include <format>
 #include <memory>
@@ -224,6 +226,7 @@ struct AppState {
     bool show_style_{false};
     bool show_detection_{false};
     bool show_goto_{false};
+    bool show_settings_{false};
 
     // Upload UI state.
     int  upload_server_{0};
@@ -700,6 +703,8 @@ static void draw_menu(AppState& app) {
             ImGui::MenuItem("Overpass",         nullptr, &app.show_overpass_);
             ImGui::MenuItem("AI Detection",     nullptr, &app.show_detection_);
             ImGui::MenuItem("Upload",           nullptr, &app.show_upload_);
+            ImGui::Separator();
+            ImGui::MenuItem("Settings",         nullptr, &app.show_settings_);
             ImGui::EndMenu();
         }
         ImGui::EndMainMenuBar();
@@ -944,6 +949,52 @@ static void draw_style(AppState& app, bool* p_open) {
     ImGui::End();
 }
 
+// ── Settings panel ────────────────────────────────────────────────────────────
+static void draw_settings(AppState& app, bool* p_open) {
+    if (!ImGui::Begin("Settings", p_open)) { ImGui::End(); return; }
+
+    ImGui::SeparatorText("Tile cache");
+
+    // Cached size is expensive to compute (walks the dir), so do it lazily and
+    // only refresh on demand or after a purge.
+    static std::uintmax_t cache_bytes = UINTMAX_MAX; // UINTMAX_MAX = not computed
+    if (cache_bytes == UINTMAX_MAX)
+        cache_bytes = map::TileCache::disk_cache_size();
+
+    ImGui::Text("On-disk cache: %.1f MB", cache_bytes / (1024.0 * 1024.0));
+    ImGui::SameLine();
+    if (ImGui::SmallButton("Refresh"))
+        cache_bytes = map::TileCache::disk_cache_size();
+
+    ImGui::TextDisabled("%s", map::TileCache::disk_cache_root().string().c_str());
+
+    if (ImGui::Button("Purge tile cache\xe2\x80\xa6"))
+        ImGui::OpenPopup("Purge tile cache?");
+
+    if (ImGui::BeginPopupModal("Purge tile cache?", nullptr,
+                               ImGuiWindowFlags_AlwaysAutoResize)) {
+        ImGui::TextUnformatted("Delete all cached map tiles from disk?\n"
+                               "They will re-download as you browse.");
+        ImGui::Separator();
+        if (ImGui::Button("Purge", ImVec2(120, 0))) {
+            std::uintmax_t freed = app.map_view.purge_tile_cache();
+            cache_bytes = map::TileCache::disk_cache_size();
+            char msg[96];
+            std::snprintf(msg, sizeof msg, "Purged tile cache (%.1f MB freed)",
+                          freed / (1024.0 * 1024.0));
+            app.map_view.set_status(msg);
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::SetItemDefaultFocus();
+        ImGui::SameLine();
+        if (ImGui::Button("Cancel", ImVec2(120, 0)))
+            ImGui::CloseCurrentPopup();
+        ImGui::EndPopup();
+    }
+
+    ImGui::End();
+}
+
 // ── Upload panel (push edits to an OSM API server) ────────────────────────────
 static void draw_upload(AppState& app, bool* p_open) {
     ImGui::Begin("Upload", p_open);
@@ -1000,6 +1051,17 @@ static void draw_upload(AppState& app, bool* p_open) {
 
 // ── Entry point ───────────────────────────────────────────────────────────────
 int main(int argc, char** argv) {
+    // Open log file in same APPDATA dir as config.json.
+    {
+        namespace fs = std::filesystem;
+        const char* appdata = std::getenv("APPDATA");
+        fs::path dir = appdata ? fs::path(appdata) / "cpposmui" : fs::current_path();
+        std::error_code ec;
+        fs::create_directories(dir, ec);
+        applog::init((dir / "cpposmui.log").string());
+    }
+    LOG_INFO("cpposmui starting");
+
     if (!glfwInit()) return 1;
 
     glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
@@ -1100,6 +1162,7 @@ int main(int argc, char** argv) {
         if (app.show_selection_) draw_inspector(app, &app.show_selection_);
         if (app.show_layers_)    draw_layers(app, &app.show_layers_);
         if (app.show_style_)     draw_style(app, &app.show_style_);
+        if (app.show_settings_)  draw_settings(app, &app.show_settings_);
         if (app.show_goto_)      draw_goto(app, &app.show_goto_);
         if (app.show_diff_)      app.diff_panel.draw(&app.show_diff_);
         if (app.show_overpass_) {
@@ -1148,7 +1211,9 @@ int main(int argc, char** argv) {
     // Persist the final view + style + login for next launch.
     persist_config(app);
 
+    LOG_INFO("cpposmui shutting down");
     net::shutdown_thread_pool();
+    applog::shutdown();
     ImGui_ImplOpenGL3_Shutdown();
     ImGui_ImplGlfw_Shutdown();
     ImGui::DestroyContext();

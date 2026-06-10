@@ -5,6 +5,7 @@
 #include <imgui.h>
 #include <misc/cpp/imgui_stdlib.h>
 #include <mapbox/earcut.hpp>
+#include <algorithm>
 #include <cmath>
 #include <cstring>
 #include <numbers>
@@ -43,6 +44,13 @@ MapView::MapView() {
 
 void MapView::set_tile_source(map::TileSource src) {
     tiles_ = std::make_unique<map::TileCache>(std::move(src));
+}
+
+std::uintmax_t MapView::purge_tile_cache() {
+    std::uintmax_t freed = map::TileCache::purge_disk_cache();
+    if (tiles_)         tiles_->clear();          // drop textures + force re-fetch
+    if (overlay_tiles_) overlay_tiles_->clear();
+    return freed;
 }
 
 void MapView::set_dataset(const osm::Dataset* ds) {
@@ -403,7 +411,21 @@ static DetectionPanel::Mosaic assemble_mosaic_helper(
         }
     }
     if (ok == 0) return {};
-    return {std::move(rgb), W, H};
+
+    // Tile-aligned geographic extent of the stitched pixels: NW corner of the
+    // top-left tile to the SE corner of the bottom-right tile. The detector maps
+    // pixels back through THIS (not the requested bbox), so features stay
+    // registered to the imagery instead of drifting.
+    double t_top, t_left, t_bot, t_right, b_top, b_left, b_bot, b_right;
+    map::TileCache::tile_to_lat_lon({zoom, tx0, ty0}, t_top, t_left, t_bot, t_right);
+    map::TileCache::tile_to_lat_lon({zoom, tx1, ty1}, b_top, b_left, b_bot, b_right);
+
+    DetectionPanel::Mosaic mo;
+    mo.rgb = std::move(rgb);
+    mo.w = W; mo.h = H;
+    mo.max_lat = t_top;   mo.min_lon = t_left;
+    mo.min_lat = b_bot;   mo.max_lon = b_right;
+    return mo;
 }
 
 void MapView::set_detection_panel(DetectionPanel* dp) {
@@ -413,11 +435,9 @@ void MapView::set_detection_panel(DetectionPanel* dp) {
         [this](double a, double b, double c, double d, int z) {
             return assemble_mosaic_helper(*tiles_, a, b, c, d, z);
         });
-    dp->set_dsm_mosaic_callback(
-        [this](double a, double b, double c, double d, int z) -> DetectionPanel::Mosaic {
-            if (!overlay_tiles_) return {};
-            return assemble_mosaic_helper(*overlay_tiles_, a, b, c, d, z);
-        });
+    // The LiDAR DSM is fetched by the detector itself from the NMPT WMS layer,
+    // so it doesn't depend on which overlay is displayed.
+    dp->set_dsm_url(map::geoportal_nmpt_url());
 }
 
 void MapView::add_detected_features(const std::vector<ai::DetectedFeature>& feats) {
@@ -560,13 +580,26 @@ void MapView::handle_click(ImVec2 m, ImVec2 origin, ImVec2 size) {
             if (!shift) { sel_nodes_.clear(); sel_ways_.clear(); }
             if (sel_nodes_.contains(n)) sel_nodes_.erase(n); // toggle off
             else                        sel_nodes_.insert(n);
+            if (detection_panel_) detection_panel_->select_feature(-1);
         } else if (int64_t w = pick_way(m, origin, size)) {
             if (!shift) { sel_nodes_.clear(); sel_ways_.clear(); }
             if (sel_ways_.contains(w)) sel_ways_.erase(w);
             else                       sel_ways_.insert(w);
-        } else if (!shift) {
-            // Click on empty space without Shift → deselect all
-            sel_nodes_.clear(); sel_ways_.clear();
+            if (detection_panel_) detection_panel_->select_feature(-1);
+        } else {
+            // Empty space (no OSM data) — try a detected feature next.
+            int dfi = detection_panel_
+                ? detection_panel_->hit_test(m, [&](double la, double lo) {
+                      return geo_to_screen(la, lo, origin, size); })
+                : -1;
+            if (dfi >= 0) {
+                detection_panel_->select_feature(dfi);
+                if (!shift) { sel_nodes_.clear(); sel_ways_.clear(); }
+            } else if (!shift) {
+                // Truly empty → deselect everything (data + detection).
+                sel_nodes_.clear(); sel_ways_.clear();
+                if (detection_panel_) detection_panel_->select_feature(-1);
+            }
         }
         break;
     }
@@ -1138,8 +1171,14 @@ void MapView::handle_input(ImVec2 origin, ImVec2 size) {
     }
 
     // Delete selected object with the Delete key while the map is focused.
-    if (hovered && ImGui::IsKeyPressed(ImGuiKey_Delete) && has_selection())
-        delete_selection();
+    // A map-selected detection candidate takes priority — remove it from the
+    // candidate list; otherwise delete the selected OSM object(s).
+    if (hovered && ImGui::IsKeyPressed(ImGuiKey_Delete)) {
+        if (detection_panel_ && detection_panel_->selected_feature() >= 0)
+            detection_panel_->remove_selected();
+        else if (has_selection())
+            delete_selection();
+    }
 
     // While drawing a way: Enter finishes, Escape cancels.
     if (tool_ == Tool::DrawWay) {
@@ -1252,6 +1291,18 @@ void MapView::handle_input(ImVec2 origin, ImVec2 size) {
             handle_click(m, origin, size);
         }
         dragging_node_ = false;
+    }
+
+    // Double-click a detected feature → accept it straight onto the active layer.
+    // (Single click selects it; double-click commits — JOSM-like.)
+    if (hovered && tool_ == Tool::Select && detection_panel_ &&
+        ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
+        int dfi = detection_panel_->hit_test(m, [&](double la, double lo) {
+            return geo_to_screen(la, lo, origin, size); });
+        if (dfi >= 0) {
+            detection_panel_->select_feature(dfi);
+            detection_panel_->approve_selected();
+        }
     }
 }
 
@@ -1374,8 +1425,18 @@ void MapView::draw() {
         const auto& cur = catalog[selected_zoom_source_];
         ImGui::SetNextItemWidth(160);
         if (ImGui::BeginCombo("##base", cur.name.c_str())) {
+            // Sort display order by category so all Satellite entries are grouped
+            // together, even when catalog indices are interleaved (e.g. OSM
+            // Standard at idx 1 for backward compat).
+            std::vector<int> order;
+            order.reserve(ov_start);
+            for (int i = 0; i < ov_start; ++i) order.push_back(i);
+            std::stable_sort(order.begin(), order.end(), [&](int a, int b) {
+                return static_cast<int>(catalog[a].category) <
+                       static_cast<int>(catalog[b].category);
+            });
             map::TileCategory last_cat = map::TileCategory(-1);
-            for (int i = 0; i < ov_start; ++i) {
+            for (int i : order) {
                 const auto& src = catalog[i];
                 if (src.category != last_cat) {
                     const char* cat_label =

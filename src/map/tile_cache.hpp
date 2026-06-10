@@ -1,6 +1,7 @@
 #pragma once
 #include <chrono>
 #include <cstdint>
+#include <filesystem>
 #include <string>
 #include <unordered_map>
 #include <mutex>
@@ -63,6 +64,9 @@ struct TileSource {
     bool         wms{false};          // true ↔ template uses {bbox}/{width}/{height}/{proj}
     std::string  crs{"EPSG:3857"};    // CRS substituted into {proj} for WMS layers
     float        opacity{1.0f};       // overlay blend alpha (1 = opaque; <1 for hillshade)
+    std::string  referer;             // Referer header sent with every tile request (empty = none)
+    int          cache_days{0};       // 0=category default, -1=never expire, >0=explicit days
+    int          min_valid_bytes{0};  // <this = server load-shed "blank" tile → retry, don't cache (0=off)
 };
 
 // Full built-in catalog.  Indices 0 and 1 are backward-compatible with the
@@ -79,23 +83,39 @@ inline const std::vector<TileSource>& tile_source_catalog() {
         { "OSM Standard",
           "https://tile.openstreetmap.org/{z}/{x}/{y}.png",
           19, TileCategory::Street },
+        // ESRI Clarity is being folded into the Wayback archive: it 301-redirects
+        // to a versioned wayback URL and only serves up to ~z17 (z18+ → 404).
+        // libcurl follows the redirect; max_zoom capped at 17 so the app overzooms
+        // instead of spamming 404s. (ESRI World Imagery above serves z19 directly.)
         { "ESRI Imagery Clarity",
           "https://clarity.maptiles.arcgis.com/arcgis/rest/services/"
           "World_Imagery/MapServer/tile/{z}/{y}/{x}",
-          19, TileCategory::Satellite },
+          17, TileCategory::Satellite },
         { "Mapbox Satellite",
           "https://api.mapbox.com/styles/v1/mapbox/satellite-v9/"
           "tiles/{z}/{x}/{y}?access_token={key}",
           22, TileCategory::Satellite, true },
-        // Geoportal (Poland) high-resolution orthophoto via WMTS GoogleMaps grid.
-        // ~25 cm/px — the best imagery available for PL, ideal for CV detection.
+        // Geoportal (Poland) high-resolution orthophoto, ~25 cm/px — the best
+        // imagery available for PL, ideal for CV detection.
+        //
+        // NOTE: the old /guest/wmts/ORTO WMTS endpoint is now auth-locked (401).
+        // The live public service is the WMS /PZGIK/ORTO/WMS/HighResolution, which
+        // takes an arbitrary BBOX so it drops straight into the WMS GetMap path.
+        // (StandardResolution exists too; HighResolution serves the sharpest tiles.)
         { "Geoportal Ortofoto (PL)",
-          "https://mapy.geoportal.gov.pl/wss/service/WMTS/guest/wmts/ORTO"
-          "?SERVICE=WMTS&REQUEST=GetTile&VERSION=1.0.0&LAYER=ORTOFOTOMAPA"
-          "&STYLE=default&FORMAT=image/jpeg&TILEMATRIXSET=EPSG:3857"
-          "&TILEMATRIX={z}&TILEROW={y}&TILECOL={x}",
-          21, TileCategory::Satellite },
-        // ── Street ──────────────────────────────────────────────────────── idx 4-8
+          "https://mapy.geoportal.gov.pl/wss/service/PZGIK/ORTO/WMS/HighResolution"
+          "?SERVICE=WMS&VERSION=1.3.0&REQUEST=GetMap&LAYERS=Raster&STYLES="
+          "&CRS={proj}&BBOX={bbox}&WIDTH={width}&HEIGHT={height}"
+          "&FORMAT=image/jpeg",
+          21, TileCategory::Satellite, /*requires_key=*/false, /*key=*/"",
+          /*wms=*/true, /*crs=*/"EPSG:3857", /*opacity=*/1.0f,
+          /*referer=*/"https://mapy.geoportal.gov.pl",
+          /*cache_days=*/0,
+          // Under concurrent load the WMS load-sheds: returns HTTP 200 with a
+          // fixed ~2419-byte all-white JPEG instead of rendering. Real ortho is
+          // always ≥7 KB, so anything under 4 KB is a blank → retry, never cache.
+          /*min_valid_bytes=*/4000 },
+        // ── Street ──────────────────────────────────────────────────────── idx 5-9
         { "CartoDB Positron",
           "https://a.basemaps.cartocdn.com/light_all/{z}/{x}/{y}.png",
           20, TileCategory::Street },
@@ -113,7 +133,7 @@ inline const std::vector<TileSource>& tile_source_catalog() {
           "https://api.mapbox.com/styles/v1/mapbox/streets-v12/"
           "tiles/{z}/{x}/{y}?access_token={key}",
           22, TileCategory::Street, true },
-        // ── Topo / Terrain ───────────────────────────────────────────────── idx 9-13
+        // ── Topo / Terrain ───────────────────────────────────────────────── idx 10-14
         { "OpenTopoMap",
           "https://tile.opentopomap.org/{z}/{x}/{y}.png",
           17, TileCategory::Topo },
@@ -121,8 +141,10 @@ inline const std::vector<TileSource>& tile_source_catalog() {
           "https://services.arcgisonline.com/ArcGIS/rest/services/"
           "World_Topo_Map/MapServer/tile/{z}/{y}/{x}",
           19, TileCategory::Topo },
+        // The bare tile-cyclosm.openstreetmap.fr host doesn't answer; the served
+        // tiles live on the a/b/c subdomains.
         { "CyclOSM",
-          "https://tile-cyclosm.openstreetmap.fr/cyclosm/{z}/{x}/{y}.png",
+          "https://a.tile-cyclosm.openstreetmap.fr/cyclosm/{z}/{x}/{y}.png",
           20, TileCategory::Topo },
         { "Thunderforest Outdoors",
           "https://tile.thunderforest.com/outdoors/{z}/{x}/{y}.png?apikey={key}",
@@ -130,13 +152,14 @@ inline const std::vector<TileSource>& tile_source_catalog() {
         { "Thunderforest OpenCycleMap",
           "https://tile.thunderforest.com/cycle/{z}/{x}/{y}.png?apikey={key}",
           22, TileCategory::Topo, true },
-        // ── Overlays (transparent, drawn on top of a base) ────────────── idx 14-17
+        // ── Overlays (transparent, drawn on top of a base) ────────────── idx 15-20
+        // Waymarked serves up to z18 (z19 → 404).
         { "Waymarked Hiking Trails",
           "https://tile.waymarkedtrails.org/hiking/{z}/{x}/{y}.png",
-          19, TileCategory::Overlay },
+          18, TileCategory::Overlay },
         { "Waymarked Cycling",
           "https://tile.waymarkedtrails.org/cycling/{z}/{x}/{y}.png",
-          19, TileCategory::Overlay },
+          18, TileCategory::Overlay },
         { "OpenSnowMap Pistes",
           "https://www.opensnowmap.org/pistes/{z}/{x}/{y}.png",
           18, TileCategory::Overlay },
@@ -153,19 +176,27 @@ inline const std::vector<TileSource>& tile_source_catalog() {
           "&CRS={proj}&BBOX={bbox}&WIDTH={width}&HEIGHT={height}"
           "&FORMAT=image/png&TRANSPARENT=TRUE",
           18, TileCategory::Overlay, /*requires_key=*/false, /*key=*/"",
-          /*wms=*/true, /*crs=*/"EPSG:3857", /*opacity=*/0.55f },
+          /*wms=*/true, /*crs=*/"EPSG:3857", /*opacity=*/0.55f,
+          /*referer=*/"https://mapy.geoportal.gov.pl" },
         // Geoportal (Poland) NMPT (Digital Surface Model) shaded-relief from the
         // LiDAR point cloud — includes buildings and vegetation canopy on top of
         // the bare ground.  Comparing visually against the NMT cieniowanie above
         // reveals man-made structures.  Also used as an input to the CV detection
         // pipeline: elevated surfaces in the DSM boost building confidence.
+        //
+        // NOTE: the old /PZGIK/NMPT/GRID1/WMS/ShadedRelief endpoint with
+        // LAYERS=Raster is now auth-locked (HTTP 401).  The live public service is
+        // /PZGIK/NMPT/WMS/ShadedRelief (no GRID1), an ArcGIS-style MapServer WMS
+        // whose shaded-relief raster is layer "1" (Title "Image"); LAYERS=Raster
+        // there returns a LayerNotDefined ServiceException.
         { "Geoportal LiDAR NMPT (PL)",
-          "https://mapy.geoportal.gov.pl/wss/service/PZGIK/NMPT/GRID1/WMS/ShadedRelief"
-          "?SERVICE=WMS&VERSION=1.3.0&REQUEST=GetMap&LAYERS=Raster&STYLES="
+          "https://mapy.geoportal.gov.pl/wss/service/PZGIK/NMPT/WMS/ShadedRelief"
+          "?SERVICE=WMS&VERSION=1.3.0&REQUEST=GetMap&LAYERS=1&STYLES="
           "&CRS={proj}&BBOX={bbox}&WIDTH={width}&HEIGHT={height}"
           "&FORMAT=image/png&TRANSPARENT=TRUE",
           18, TileCategory::Overlay, /*requires_key=*/false, /*key=*/"",
-          /*wms=*/true, /*crs=*/"EPSG:3857", /*opacity=*/0.55f },
+          /*wms=*/true, /*crs=*/"EPSG:3857", /*opacity=*/0.55f,
+          /*referer=*/"https://mapy.geoportal.gov.pl" },
     };
     return C;
 }
@@ -182,9 +213,18 @@ inline int tile_overlay_start() {
 inline TileSource esri_satellite() { return tile_source_catalog()[0]; }
 inline TileSource osm_standard()   { return tile_source_catalog()[1]; }
 
+// WMS GetMap template ({bbox}/{width}/{height}/{proj}) of the Geoportal NMPT
+// LiDAR shaded-relief layer, used as the DSM input to the CV detector.
+// Empty if the catalog entry is missing.
+inline std::string geoportal_nmpt_url() {
+    for (const auto& s : tile_source_catalog())
+        if (s.url_template.find("/NMPT/") != std::string::npos) return s.url_template;
+    return {};
+}
+
 class TileCache {
 public:
-    explicit TileCache(TileSource source) : source_(std::move(source)) {}
+    explicit TileCache(TileSource source);
 
     // Request a tile; starts async fetch if not cached. Returns current state.
     TileState request(const TileCoord& coord);
@@ -196,6 +236,12 @@ public:
     uint32_t texture(const TileCoord& coord) const;
 
     void clear();
+
+    // ── On-disk cache management (covers ALL sources, not just this one) ──
+    // The persistent tile cache lives under %APPDATA%/cpposmui/tile_cache.
+    static std::filesystem::path disk_cache_root();
+    static std::uintmax_t        disk_cache_size();   // total bytes on disk
+    static std::uintmax_t        purge_disk_cache();  // delete all; returns bytes freed
 
     // Read-only access to the configured source (name, category, opacity, …).
     const TileSource& source() const { return source_; }
@@ -216,9 +262,14 @@ public:
 
 private:
     TileSource source_;
+    std::filesystem::path cache_dir_;
     mutable std::mutex mu_;
     std::unordered_map<TileCoord, Tile> tiles_;
 
+    static std::string source_slug(const std::string& name);
+    std::filesystem::path disk_cache_path(const TileCoord& c) const;
+    int cache_max_age_days() const;
+    bool disk_cache_stale(const std::filesystem::path& p) const;
     std::string build_url(const TileCoord& c) const;
     void fetch_async(TileCoord coord);
 };

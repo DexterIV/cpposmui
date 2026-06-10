@@ -72,11 +72,13 @@ void detect_custom_rest(const std::string& url_template,
 // Classical CV on pre-assembled tile imagery: Sobel edge detection + color
 // segmentation to extract building footprints and road centre-lines.
 // rgb_pixels: H*W*3 row-major RGB bytes.  bbox: geographic extent of the image.
+// simplify_px: Douglas-Peucker tolerance in pixels for building outlines
+// (roads use 1.4×). Higher = fewer nodes per feature.
 void detect_cv_on_imagery(const std::vector<uint8_t>& rgb_pixels,
                           int img_w, int img_h,
                           double min_lat, double min_lon,
                           double max_lat, double max_lon,
-                          Callback cb);
+                          Callback cb, double simplify_px = 3.5);
 
 // Classical CV enhanced with LiDAR-derived DSM (NMPT) shaded relief.
 // dsm_gray: H*W single-channel grayscale raster from the DSM WMS (same
@@ -88,7 +90,25 @@ void detect_cv_with_dsm(const std::vector<uint8_t>& rgb_pixels,
                          int img_w, int img_h,
                          double min_lat, double min_lon,
                          double max_lat, double max_lon,
-                         Callback cb);
+                         Callback cb, double simplify_px = 3.5);
+
+// BBox-driven CV: fetches the imagery tiles for the bbox from a slippy/WMTS
+// imagery layer ({z}/{x}/{y}, key substituted) at `zoom`, stitches them, and
+// runs the classical CV pipeline.  Self-contained — no GL tile cache needed.
+void detect_cv_bbox(const std::string& imagery_url, int zoom,
+                    double min_lat, double min_lon,
+                    double max_lat, double max_lon,
+                    Callback cb, double simplify_px = 3.5);
+
+// BBox-driven CV + LiDAR: as above, plus fetches a co-registered DSM mosaic from
+// a WMS shaded-relief layer (dsm_wms_url uses {bbox}/{width}/{height}/{proj},
+// e.g. the Geoportal NMPT LiDAR layer) and cross-references elevation evidence.
+// The DSM always comes from this layer regardless of which overlay is displayed.
+void detect_cv_lidar_bbox(const std::string& imagery_url,
+                          const std::string& dsm_wms_url, int zoom,
+                          double min_lat, double min_lon,
+                          double max_lat, double max_lon,
+                          Callback cb, double simplify_px = 3.5);
 
 #ifdef CPPOSMUI_HAVE_ONNXRUNTIME
 // Local ONNX model inference on the assembled tile imagery.

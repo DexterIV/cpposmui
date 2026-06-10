@@ -1,16 +1,20 @@
 file(GLOB_RECURSE TEST_SOURCES CONFIGURE_DEPENDS *.cpp)
 
-# Tests don't need OpenGL/ImGui/GLFW – link only the data/net/osm parts
+# Tests don't need OpenGL/ImGui/GLFW – link only the data/net/osm/ai parts.
+# detection.cpp needs the stb_image implementation; in the app it lives in
+# src/map/tile_cache.cpp (GL-linked), so tests provide it via stb_impl.cpp.
 add_library(cpposmui_core STATIC
     ${CMAKE_SOURCE_DIR}/src/osm/parser.cpp
     ${CMAKE_SOURCE_DIR}/src/osm/diff.cpp
     ${CMAKE_SOURCE_DIR}/src/osm/spatial_index.cpp
     ${CMAKE_SOURCE_DIR}/src/net/http.cpp
     ${CMAKE_SOURCE_DIR}/src/net/overpass.cpp
+    ${CMAKE_SOURCE_DIR}/src/ai/detection.cpp
 )
 target_include_directories(cpposmui_core PUBLIC ${CMAKE_SOURCE_DIR}/src)
 target_link_libraries(cpposmui_core PUBLIC
     pugixml
+    stb
     nlohmann_json::nlohmann_json
     CURL::libcurl
 )
